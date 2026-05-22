@@ -93,7 +93,14 @@ class D1Client:
     def batch_insert(self, sql, rows, batch_size=200):
         """
         Multi-VALUES INSERT in chunks.
-        sql_template should end with VALUES (placeholders) — we replace the VALUES clause.
+
+        IMPORTANT: D1 has a hard limit of 100 bound parameters per statement.
+        With multi-row INSERT, params = rows * cols, which quickly exceeds 100.
+        Workaround: we INLINE values into SQL (no bind params) — D1 allows
+        much larger raw SQL (up to ~1MB per execute).
+
+        sql_template should end with VALUES (?,?,...) — we use the placeholder
+        count to determine column count but build inline values ourselves.
         rows: list of tuples (each tuple matches the column order in sql_template).
 
         Example:
@@ -103,29 +110,42 @@ class D1Client:
         if not rows:
             return 0
 
-        # Find the VALUES (...) part
         upper = sql.upper()
         idx = upper.rfind('VALUES')
         if idx < 0:
             raise ValueError('sql must contain VALUES clause')
         prefix = sql[:idx]  # everything up to "VALUES "
-        # Extract single-row template like "(?, ?, ?)"
+        # Single-row template — count placeholders to validate column count
         tmpl = sql[idx + len('VALUES'):].strip()
-
         n_cols = tmpl.count('?')
+
         total_written = 0
         for i in range(0, len(rows), batch_size):
             chunk = rows[i:i + batch_size]
-            placeholders = ', '.join([tmpl] * len(chunk))
-            full_sql = f'{prefix} VALUES {placeholders}'
-            params = []
+            # Build inline values block
+            inline_rows = []
             for r in chunk:
                 if len(r) != n_cols:
                     raise ValueError(f'row has {len(r)} values, expected {n_cols}: {r}')
-                params.extend(r)
-            meta = self.execute(full_sql, params)
+                inline_rows.append('(' + ', '.join(_sql_literal(v) for v in r) + ')')
+            values_block = ', '.join(inline_rows)
+            full_sql = f'{prefix} VALUES {values_block}'
+            meta = self.execute(full_sql)
             total_written += meta.get('rows_written', 0)
         return total_written
+
+
+def _sql_literal(v):
+    """Convert Python value to SQL literal (for inline INSERT without bind params)."""
+    if v is None:
+        return 'NULL'
+    if isinstance(v, bool):
+        return '1' if v else '0'
+    if isinstance(v, (int, float)):
+        return str(v)
+    # String — escape single quotes
+    s = str(v).replace("'", "''")
+    return f"'{s}'"
 
 
 class D1Error(Exception):
