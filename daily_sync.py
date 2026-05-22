@@ -208,14 +208,18 @@ def aggregator_fill_gaps(d1):
     today = date.today()
     yesterday = (today - timedelta(days=1)).isoformat()
 
-    # Use yesterday's date as the bar date
-    sql = f"""
-        SELECT y.ticker AS ticker,
-               MAX(y.ts) AS last_ts,
-               (SELECT mid FROM yahoo_quotes WHERE ticker = y.ticker AND ts = MAX(y.ts)) AS mid
+    # Get LAST snapshot per ticker for yesterday — using JOIN with subquery
+    # (SQLite/D1 doesn't allow MAX() inside correlated subquery the same row).
+    sql = """
+        SELECT y.ticker AS ticker, y.ts AS last_ts, y.mid AS mid
         FROM yahoo_quotes y
-        WHERE date(y.ts, 'unixepoch') = ?
-        GROUP BY y.ticker
+        INNER JOIN (
+            SELECT ticker, MAX(ts) AS max_ts
+            FROM yahoo_quotes
+            WHERE date(ts, 'unixepoch') = ?
+            GROUP BY ticker
+        ) latest
+          ON y.ticker = latest.ticker AND y.ts = latest.max_ts
     """
     rows = d1.select(sql, [yesterday])
 
