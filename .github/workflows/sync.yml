@@ -1,0 +1,68 @@
+name: Daily sync
+
+on:
+  # 22:05 UTC daily — 5 minutes after US market close to let Polygon settle
+  schedule:
+    - cron: '5 22 * * MON-FRI'
+  # Manual trigger from UI
+  workflow_dispatch:
+    inputs:
+      tickers:
+        description: 'Tickers to sync (space-separated, leave empty for all)'
+        required: false
+        default: ''
+      max_contracts:
+        description: 'Max contracts per ticker (testing limit)'
+        required: false
+        default: ''
+      skip_discovery:
+        description: 'Skip discovery phase'
+        type: boolean
+        required: false
+        default: false
+      skip_prices:
+        description: 'Skip price update phase'
+        type: boolean
+        required: false
+        default: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350  # 5h50min — under the 6h GHA per-job limit
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Run daily sync
+        env:
+          POLYGON_API_KEY: ${{ secrets.POLYGON_API_KEY }}
+          POLYGON_API_KEY_2: ${{ secrets.POLYGON_API_KEY_2 }}
+          POLYGON_API_KEY_3: ${{ secrets.POLYGON_API_KEY_3 }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_D1_DB_ID: ${{ secrets.CLOUDFLARE_D1_DB_ID }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          ARGS=""
+          if [ -n "${{ inputs.tickers }}" ]; then
+            ARGS="$ARGS --tickers ${{ inputs.tickers }}"
+          fi
+          if [ -n "${{ inputs.max_contracts }}" ]; then
+            ARGS="$ARGS --max-contracts ${{ inputs.max_contracts }}"
+          fi
+          if [ "${{ inputs.skip_discovery }}" = "true" ]; then
+            ARGS="$ARGS --skip-discovery"
+          fi
+          if [ "${{ inputs.skip_prices }}" = "true" ]; then
+            ARGS="$ARGS --skip-prices"
+          fi
+          echo "Running: python daily_sync.py $ARGS"
+          python daily_sync.py $ARGS

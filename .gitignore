@@ -1,0 +1,18 @@
+# Никогда не коммитить
+.env
+.env.*
+*.pem
+*.key
+secrets/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Local logs / outputs
+*.log
+*.tmp
+sync_state.json
+.DS_Store
