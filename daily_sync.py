@@ -23,7 +23,10 @@ import traceback
 from datetime import date, datetime, timedelta
 
 from lib.d1 import D1Client, D1Error
-from lib.polygon import PolygonClient, PolygonError, is_monthly_leaps
+from lib.polygon import (
+    PolygonClient, PolygonError,
+    classify_expirations, MIN_TTE_DAYS_FOR_DISCOVERY, MIN_STRIKES_FOR_MONTHLY,
+)
 from lib.telegram import send_alert
 
 
@@ -48,12 +51,22 @@ def mark_expired_contracts(d1):
 
 
 def discovery_for_ticker(d1, poly, ticker):
-    """Find new monthly contracts for one underlying. Returns (n_new, n_total_scanned)."""
+    """
+    Find new monthly/LEAPS contracts for one underlying.
+
+    Two-pass:
+      1. Pull ALL active calls from Polygon (could be 5K+ for liquid tickers).
+      2. classify_expirations() group by expiration_date → for each date compute
+         n_strikes / range_pct / TTE. Keep only is_monthly_or_leap=True dates.
+         This catches Thursday LEAPS, EOM quarterly etc — no hardcoded weekday.
+      3. INSERT new contracts (discovery_source='auto').
+
+    Returns (n_new, n_total_scanned).
+    """
     log(f'  [discovery] {ticker}: scanning Polygon contracts...')
-    new_rows = []
     n_total = 0
-    n_monthly = 0
     n_call = 0
+    calls_buffer = []  # collect ALL call contracts before classifying
 
     # Get list of contracts already in D1
     existing_resp = d1.select(
@@ -62,45 +75,68 @@ def discovery_for_ticker(d1, poly, ticker):
     )
     existing = {r['ticker'] for r in existing_resp}
 
-    # Fetch active contracts from Polygon
+    # Pass 1: fetch all active calls from Polygon
     try:
         for c in poly.list_contracts(ticker, expired=False, limit=1000):
             n_total += 1
             if c.get('contract_type') != 'call':
                 continue
             n_call += 1
-            exp = c.get('expiration_date', '')
-            if not is_monthly_leaps(exp):
-                continue
-            n_monthly += 1
-            occ = c.get('ticker')
-            if not occ or occ in existing:
-                continue
-            new_rows.append((
-                occ,
-                ticker,
-                'call',
-                c.get('strike_price'),
-                exp,
-                c.get('exercise_style'),
-                c.get('shares_per_contract', 100),
-                c.get('primary_exchange'),
-                c.get('cfi'),
-                0,  # expired = 0 since we queried expired=false
-                datetime.utcnow().isoformat() + 'Z',
-            ))
+            calls_buffer.append(c)
     except PolygonError as e:
         log(f'  [discovery] {ticker}: WARN polygon error: {e}')
 
+    # Pass 2: classify expirations
+    exp_classes = classify_expirations(calls_buffer)
+    accepted_exps = {e for e, m in exp_classes.items() if m['is_monthly_or_leap']}
+
+    # Log breakdown of rejected expirations (for transparency)
+    rejected = [(e, m) for e, m in exp_classes.items() if not m['is_monthly_or_leap']]
+    if rejected:
+        log(f'  [discovery] {ticker}: rejected {len(rejected)} expirations '
+            f'(TTE<{MIN_TTE_DAYS_FOR_DISCOVERY}d or n_strikes<{MIN_STRIKES_FOR_MONTHLY}):')
+        for e, m in sorted(rejected)[:5]:
+            log(f'      {e} ({m["n_strikes"]} strikes, TTE={m["tte_days"]}d): {m["reject_reason"]}')
+        if len(rejected) > 5:
+            log(f'      ... and {len(rejected) - 5} more')
+
+    # Build new rows
+    new_rows = []
+    n_monthly = 0
+    for c in calls_buffer:
+        exp = c.get('expiration_date', '')
+        if exp not in accepted_exps:
+            continue
+        n_monthly += 1
+        occ = c.get('ticker')
+        if not occ or occ in existing:
+            continue
+        new_rows.append((
+            occ,
+            ticker,
+            'call',
+            c.get('strike_price'),
+            exp,
+            c.get('exercise_style'),
+            c.get('shares_per_contract', 100),
+            c.get('primary_exchange'),
+            c.get('cfi'),
+            0,  # expired = 0 since we queried expired=false
+            datetime.utcnow().isoformat() + 'Z',
+            'auto',  # discovery_source
+        ))
+
     log(f'  [discovery] {ticker}: {n_total} polygon contracts, {n_call} calls, '
-        f'{n_monthly} monthly, {len(new_rows)} NEW')
+        f'{len(accepted_exps)} expirations accepted, {n_monthly} contracts pass filter, '
+        f'{len(new_rows)} NEW')
 
     if new_rows:
         d1.batch_insert(
             "INSERT OR IGNORE INTO contracts "
             "(ticker, underlying, contract_type, strike_price, expiration_date, "
             " exercise_style, shares_per_contract, primary_exchange, cfi, "
-            " expired, discovered_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            " expired, discovered_at, discovery_source) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
             new_rows,
             batch_size=100,
         )

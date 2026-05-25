@@ -16,3 +16,11 @@ venv/
 *.tmp
 sync_state.json
 .DS_Store
+
+# wrangler local data (cached)
+.wrangler/
+
+# One-off generated SQL / json (used for backfill, not source code)
+new_contracts.json
+insert_new_contracts.sql
+*.sql.tmp

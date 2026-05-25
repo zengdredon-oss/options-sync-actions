@@ -36,7 +36,7 @@ class PolygonClient:
         self.key_idx += 1
         return k
 
-    def get(self, url, extra_params=None, max_retries=3):
+    def get(self, url, extra_params=None, max_retries=5):
         """GET with key rotation and 429 retry."""
         # Strip any existing apiKey from url
         if 'apiKey=' in url:
@@ -76,10 +76,17 @@ class PolygonClient:
                 raise PolygonError(f'URL error: {e}') from e
         raise PolygonError(f'All retries exhausted for {url}')
 
-    def list_contracts(self, underlying, expired=False, limit=1000):
-        """Generator over all contracts for an underlying. Paginates via next_url."""
+    def list_contracts(self, underlying, expired=False, limit=1000, contract_type='call'):
+        """
+        Generator over contracts for an underlying. Paginates via next_url.
+
+        contract_type filter applied at Polygon side (saves pages — without it
+        Polygon mixes calls and puts in pagination, doubling work).
+        """
+        ct_param = f'&contract_type={contract_type}' if contract_type else ''
         url = (f'https://api.polygon.io/v3/reference/options/contracts'
-               f'?underlying_ticker={underlying}&expired={"true" if expired else "false"}&limit={limit}')
+               f'?underlying_ticker={underlying}&expired={"true" if expired else "false"}'
+               f'{ct_param}&limit={limit}')
         page = 0
         while url:
             page += 1
@@ -110,11 +117,135 @@ class PolygonError(Exception):
     pass
 
 
+# =====================================================================================
+# Expiration classification — robust, без hardcoded дней недели
+#
+# Реальность: CBOE листит LEAPS не только на 3-ю пятницу. Например GLD имеет LEAPS на
+#   2027-06-17 (четверг, 164 страйка) — это игнорировалось старым фильтром weekday==Friday.
+# Кроме того есть EOM quarterly options (последний рабочий день квартала, среда/вторник).
+#
+# Polygon API не предоставляет поля типа `is_leap` — все опционы имеют одинаковый cfi='OCASPS'.
+# Authoritative LEAPS feed в свободном доступе НЕ существует (CBOE/OCC публикуют только specs).
+#
+# Поэтому используем эмпирическую классификацию по характеристикам expiration date:
+#   - LEAPS / monthly = широкий strike range + достаточное количество страйков + не weekly
+# Двухуровневый критерий:
+#   1. TTE_at_discovery >= MIN_TTE_DAYS  — отсекает true weeklies (живут 1-2 недели)
+#   2. n_strikes >= MIN_STRIKES          — отсекает 0DTE с узким ATM
+#
+# Defaults подобраны эмпирически: на GLD 2026-2027 LEAPS/monthly имеют n_strikes 100-280,
+# weeklies — около 100, 0DTE — <30. TTE LEAPS — всегда >270 при первой discovery.
+# =====================================================================================
+MIN_TTE_DAYS_FOR_DISCOVERY = 30
+MIN_STRIKES_FOR_MONTHLY = 50
+
+# Strong override: если listing очень wide — это LEAPS даже если TTE < 30 дней.
+# Нужно чтобы не пропустить Thursday LEAPS близко к экспирации (typical pattern:
+# 3rd Thursday в месяце экспирации, TTE 7-28 дней).
+# Эмпирически на GLD: weekly Friday имеет n=152 range=251%, LEAPS имеет n>=150 AND range>=400%.
+WIDE_LISTING_N_STRIKES = 150
+WIDE_LISTING_RANGE_PCT = 400
+
+
+def classify_expirations(contracts_list, today=None):
+    """
+    Group contracts by expiration_date and compute per-expiration metrics.
+
+    Args:
+        contracts_list: список dict'ов от Polygon с полями expiration_date, strike_price.
+        today: date для подсчёта TTE (default = date.today()).
+
+    Returns:
+        dict {expiration_date: {
+            'n_strikes': int,
+            'min_strike': float,
+            'max_strike': float,
+            'range_pct': float,
+            'tte_days': int,
+            'is_monthly_or_leap': bool,
+            'reject_reason': str | None,
+        }}
+
+    Принимаем expiration date если ОДНО из:
+      A. n_strikes >= WIDE (150) AND range_pct >= WIDE_RANGE (400) — "очень wide listing"
+         (LEAPS даже если TTE < 30 — это включает Thursday LEAPS близко к экспирации).
+      B. n_strikes >= 50 AND TTE >= 30 — стандартное monthly/quarterly
+         (weeklies успевают экспирировать в течение 30 дней).
+
+    На GLD 2026-2027 это:
+      ✅ ACCEPT: все Friday-monthly (3-я пятница), Thursday LEAPS (2026-06-18, 2027-06-17),
+                 EOM quarterly (Tue/Wed last day of quarter).
+      ❌ REJECT: weeklies/daily в ближайшие 30 дней, 0DTE.
+
+    Возможный false positive: weekly с TTE>=30 (например 4-я пятница месяца). Не критично —
+    они экспирят в течение 1-4 недель, шума мало. UI может дополнительно фильтровать по TTE.
+    """
+    from collections import defaultdict
+    if today is None:
+        today = date.today()
+    groups = defaultdict(list)
+    for c in contracts_list:
+        exp = c.get('expiration_date')
+        sp = c.get('strike_price')
+        if exp and sp is not None:
+            groups[exp].append(sp)
+
+    result = {}
+    for exp, strikes in groups.items():
+        try:
+            d = date.fromisoformat(exp)
+        except (ValueError, TypeError):
+            continue
+        n = len(strikes)
+        min_k = min(strikes) if strikes else 0
+        max_k = max(strikes) if strikes else 0
+        range_pct = (max_k - min_k) / max(min_k, 1) * 100 if min_k > 0 else 0
+        tte_days = (d - today).days
+
+        # Reject TTE in the past (already expired)
+        if tte_days < 0:
+            reject = f'tte={tte_days}d (expired)'
+            accept = False
+        # Rule A: wide listing → LEAPS, accept regardless of TTE
+        elif n >= WIDE_LISTING_N_STRIKES and range_pct >= WIDE_LISTING_RANGE_PCT:
+            accept = True
+            reject = None
+        # Rule B: standard monthly/quarterly
+        elif n >= MIN_STRIKES_FOR_MONTHLY and tte_days >= MIN_TTE_DAYS_FOR_DISCOVERY:
+            accept = True
+            reject = None
+        else:
+            # Compose reject reason for transparency
+            reasons = []
+            if n < MIN_STRIKES_FOR_MONTHLY:
+                reasons.append(f'n_strikes={n}<{MIN_STRIKES_FOR_MONTHLY}')
+            if tte_days < MIN_TTE_DAYS_FOR_DISCOVERY:
+                reasons.append(f'tte={tte_days}d<{MIN_TTE_DAYS_FOR_DISCOVERY}')
+            if n < WIDE_LISTING_N_STRIKES or range_pct < WIDE_LISTING_RANGE_PCT:
+                reasons.append(f'not wide enough (need n>={WIDE_LISTING_N_STRIKES} AND range>={WIDE_LISTING_RANGE_PCT}%)')
+            reject = ' AND '.join(reasons) or 'unclassified'
+            accept = False
+
+        result[exp] = {
+            'n_strikes': n,
+            'min_strike': min_k,
+            'max_strike': max_k,
+            'range_pct': range_pct,
+            'tte_days': tte_days,
+            'is_monthly_or_leap': accept,
+            'reject_reason': reject,
+        }
+    return result
+
+
 def is_monthly_leaps(expiration_date_str):
     """
-    True iff this is a "standard monthly" expiration (3rd Friday of month).
-    These include LEAPS (>9 months out) and shorter monthlies. We trade only these.
-    Python weekday: Monday=0, Friday=4.
+    DEPRECATED. Legacy hardcoded filter: weekday=Friday AND day 15-21.
+    Используется только для совместимости со старым кодом — новый код должен
+    использовать classify_expirations() с двухуровневым фильтром.
+
+    Bug этого фильтра (обнаружено 2026-05-25): пропускает Thursday LEAPS
+    (например GLD 2027-06-17) и EOM quarterly (последний рабочий день квартала).
     """
     try:
         d = date.fromisoformat(expiration_date_str)
