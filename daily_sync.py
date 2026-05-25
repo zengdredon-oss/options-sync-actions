@@ -34,6 +34,19 @@ def log(msg):
 # =====================================================================================
 # Phase 1 — Discovery
 # =====================================================================================
+def mark_expired_contracts(d1):
+    """Update expired flag for all contracts whose expiration_date has passed.
+    Run before discovery so we don't re-fetch quotes for dead contracts."""
+    meta = d1.execute(
+        "UPDATE contracts SET expired = 1 "
+        "WHERE expired = 0 AND expiration_date < date('now')"
+    )
+    n = meta.get('rows_written', 0) or meta.get('changes', 0) or 0
+    if n > 0:
+        log(f'  [discovery] marked {n} contracts as expired (date passed)')
+    return n
+
+
 def discovery_for_ticker(d1, poly, ticker):
     """Find new monthly contracts for one underlying. Returns (n_new, n_total_scanned)."""
     log(f'  [discovery] {ticker}: scanning Polygon contracts...')
@@ -317,6 +330,8 @@ def main():
         # Phase 1: discovery
         if not args.skip_discovery:
             log('=== Phase 1: Discovery ===')
+            # Mark expired contracts first (idempotent, safe to run daily)
+            mark_expired_contracts(d1)
             for tk in tickers:
                 n_new, _ = discovery_for_ticker(d1, poly, tk)
                 summary['discovery_new'] += n_new
