@@ -36,8 +36,16 @@ class PolygonClient:
         self.key_idx += 1
         return k
 
-    def get(self, url, extra_params=None, max_retries=5):
-        """GET with key rotation and 429 retry."""
+    def get(self, url, extra_params=None, max_retries=3, timeout=12):
+        """
+        GET with key rotation and 429 retry.
+
+        Defaults tuned для daily_sync (2026-05-26 issues):
+          - timeout=12 (was 30): Polygon обычно отвечает в <2s; если >12s — что-то висит,
+            проще пропустить контракт чем убить job timeout.
+          - max_retries=3 (was 5): для контрактов где Polygon stably медленный (deep OTM
+            never-traded), достаточно 2-3 попыток. Не блокирует job.
+        """
         # Strip any existing apiKey from url
         if 'apiKey=' in url:
             url = url.split('apiKey=')[0].rstrip('&?')
@@ -53,7 +61,7 @@ class PolygonClient:
 
             try:
                 req = urllib.request.Request(full_url)
-                with urllib.request.urlopen(req, timeout=30) as resp:
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
                     self.req_count += 1
                     return json.loads(resp.read().decode('utf-8'))
             except urllib.error.HTTPError as e:
@@ -69,11 +77,13 @@ class PolygonClient:
                     raise PolygonError(f'403 NOT_AUTHORIZED for {url} (Free tier limitation?)')
                 else:
                     raise PolygonError(f'HTTP {e.code}: {url}') from e
-            except urllib.error.URLError as e:
+            except (urllib.error.URLError, TimeoutError, OSError) as e:
+                # TimeoutError = socket read timeout. URLError = connection refused/DNS.
+                # OSError = misc network issues. На последнем attempt — raise.
                 if attempt < max_retries - 1:
-                    time.sleep(2 ** attempt)
+                    time.sleep(min(2 ** attempt, 8))  # cap backoff at 8s
                     continue
-                raise PolygonError(f'URL error: {e}') from e
+                raise PolygonError(f'Network error: {type(e).__name__}: {e}') from e
         raise PolygonError(f'All retries exhausted for {url}')
 
     def list_contracts(self, underlying, expired=False, limit=1000, contract_type='call'):
