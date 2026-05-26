@@ -495,8 +495,10 @@ def main():
         # Phase 2: price update
         if not args.skip_prices:
             log('=== Phase 2: Price update ===')
-            # Распределяем max_runtime между тикерами равномерно
-            per_ticker_runtime = max_runtime // len(tickers) if (max_runtime and tickers) else None
+            # Резервируем 30 мин для phase 3 (aggregator + cleanup), distrib остальное.
+            AGG_BUFFER_MIN = 30
+            effective_runtime = max(60, max_runtime - AGG_BUFFER_MIN) if max_runtime else None
+            per_ticker_runtime = effective_runtime // len(tickers) if (effective_runtime and tickers) else None
             for tk in tickers:
                 log(f'  [price] {tk}...')
                 res = price_update(d1, poly, tk, args.max_contracts, args.days_back,
