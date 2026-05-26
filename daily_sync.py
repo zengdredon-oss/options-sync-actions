@@ -167,33 +167,56 @@ def price_update(d1, poly, ticker=None, max_contracts=None, days_back=14, force_
     to_date = today.isoformat()
     cutoff_ts = int(time.time()) - 20 * 3600  # 20 hours ago
 
-    # Query active contracts.
-    # Sort by expiration_date DESC: long-dated LEAPS первыми (наша target зона far-OTM
-    # longshots — приоритет дальним), затем ближе к экспирации.
+    # Query active contracts с tri-priority сортировкой по стратегии:
+    #   1. moneyness DESC — чем дальше OTM (strike > spot), тем приоритетнее.
+    #      Наша target зона = far-OTM longshots (ms ≥ +100%).
+    #   2. expiration_date DESC — чем дальше экспирация, тем приоритетнее
+    #      (max long-dated LEAPS = больше времени на upside).
+    #   3. coverage (bars_90d) DESC — чем больше истории, тем информативнее
+    #      DD/Rally расчёты (для алертов).
+    #
+    # JOIN на tickers даёт текущий spot (underlying_price), считаем ms_now inline.
+    # LEFT JOIN на aggregated bars для подсчёта bars_90d (coverage proxy).
+    # COALESCE на случай если spot=NULL (новый тикер до первого underlying sync).
     where = "c.expired = 0 AND c.expiration_date >= date('now')"
     params = []
     if ticker:
         where += " AND c.underlying = ?"
         params.append(ticker)
 
+    base_sql = f"""
+        SELECT c.ticker FROM contracts c
+        JOIN tickers t ON t.symbol = c.underlying
+        LEFT JOIN (
+            SELECT ticker, COUNT(*) AS bars_90d
+            FROM option_bars
+            WHERE date >= date('now', '-90 days')
+            GROUP BY ticker
+        ) hist ON hist.ticker = c.ticker
+        WHERE {where}
+          AND COALESCE(t.underlying_price, 0) > 0
+    """
+
     if force_all:
-        sql = f"""
-            SELECT c.ticker FROM contracts c
-            WHERE {where}
-            ORDER BY c.expiration_date DESC, c.strike_price DESC
+        sql = base_sql + """
+            ORDER BY
+              ((c.strike_price - t.underlying_price) / t.underlying_price) DESC,
+              c.expiration_date DESC,
+              COALESCE(hist.bars_90d, 0) DESC
         """
     else:
         # Skip-if-recent: исключаем те, у которых уже есть свежий Polygon bar
-        sql = f"""
-            SELECT c.ticker FROM contracts c
-            WHERE {where}
+        sql = base_sql + """
               AND NOT EXISTS (
                 SELECT 1 FROM option_bars b
                 WHERE b.ticker = c.ticker
                   AND b.source = 'polygon'
                   AND b.updated_at > ?
               )
-            ORDER BY c.expiration_date DESC, c.strike_price DESC
+            ORDER BY
+              ((c.strike_price - t.underlying_price) / t.underlying_price) DESC,
+              c.expiration_date DESC,
+              COALESCE(hist.bars_90d, 0) DESC
         """
         params.append(cutoff_ts)
 
@@ -201,10 +224,14 @@ def price_update(d1, poly, ticker=None, max_contracts=None, days_back=14, force_
     contracts = [r['ticker'] for r in rows]
 
     # Count total active (для информативности)
+    count_where = "expired = 0 AND expiration_date >= date('now')"
+    count_params = []
+    if ticker:
+        count_where += " AND underlying = ?"
+        count_params.append(ticker)
     total_active_resp = d1.select(
-        f"SELECT COUNT(*) AS n FROM contracts c WHERE {where.split(' AND c.underlying')[0]}"
-        + (" AND c.underlying = ?" if ticker else ''),
-        ([ticker] if ticker else []),
+        f"SELECT COUNT(*) AS n FROM contracts WHERE {count_where}",
+        count_params,
     )
     total_active = total_active_resp[0]['n'] if total_active_resp else 0
     n_skipped = max(0, total_active - len(contracts))
